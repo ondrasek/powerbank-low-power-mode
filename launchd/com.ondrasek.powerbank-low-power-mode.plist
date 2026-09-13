@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ondrasek.powerbank-low-power-mode</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/powerbank-lpm</string>
+        <string>watch</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- `watch` blocks on the pslog stream and only exits if that stream dies,
+         so KeepAlive means "restart the event source", not "respawn a one-shot". -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Floor on respawn rate: without it a persistently failing pslog would
+         spin launchd in a tight restart loop. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/powerbank-lpm.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/powerbank-lpm.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

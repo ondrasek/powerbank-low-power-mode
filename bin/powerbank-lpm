@@ -1,0 +1,240 @@
+#!/bin/bash
+# powerbank-lpm — toggle macOS Low Power Mode based on which USB-C adapter is attached.
+#
+# Runs as root from a LaunchDaemon (pmset writes require root). Event-driven via
+# `pmset -g pslog`; no polling.
+set -uo pipefail
+
+VERSION="0.1.0"
+LABEL="com.ondrasek.powerbank-low-power-mode"
+CONFIG="${POWERBANK_LPM_CONFIG:-/usr/local/etc/powerbank-lpm.conf}"
+STATE="${POWERBANK_LPM_STATE:-/var/db/powerbank-lpm.state}"
+
+# --- config defaults (overridable in $CONFIG) ---------------------------------
+# Newline-separated adapter fingerprints treated as power banks. See `identify`.
+BANK_FINGERPRINTS=""
+# Fallback when no fingerprint matches: adapters at or below this wattage count
+# as power banks. Empty disables the fallback (fingerprints only).
+BANK_MAX_WATTS=""
+# What to do when running on the internal battery: on | off | ignore
+ON_BATTERY="ignore"
+
+# --- adapter inspection -------------------------------------------------------
+
+# Raw AdapterDetails dict, or empty when nothing is attached.
+adapter_raw() {
+    ioreg -rn AppleSmartBattery 2>/dev/null |
+        sed -n 's/.*"AdapterDetails" = {\(.*\)}.*/\1/p' | head -1
+}
+
+# Pull one key out of an AdapterDetails dict read on stdin, first match wins.
+# Quoted and bare values both occur, e.g. "Watts"=60 and "Description"="pd charger".
+# Written in awk deliberately: BSD sed has no \| alternation, so a sed version
+# fails silently on macOS and yields an empty fingerprint.
+adapter_field() {
+    awk -v k="\"$1\"=" '
+        { i = index($0, k); if (i == 0) exit
+          r = substr($0, i + length(k))
+          if (substr(r, 1, 1) == "\"") { r = substr(r, 2); print substr(r, 1, index(r, "\"") - 1) }
+          else { j = match(r, /[,}]/); print j ? substr(r, 1, j - 1) : r }
+          exit }'
+}
+
+# Stable identity for an adapter. SerialString is absent on most third-party
+# chargers, so the tuple degrades to the electrical profile.
+adapter_fingerprint() {
+    local d="${1:-}"
+    [ -n "$d" ] || return 1
+    printf 'w=%s;id=%s;fc=%s;sn=%s\n' \
+        "$(printf '%s' "$d" | adapter_field Watts)" \
+        "$(printf '%s' "$d" | adapter_field AdapterID)" \
+        "$(printf '%s' "$d" | adapter_field FamilyCode)" \
+        "$(printf '%s' "$d" | adapter_field SerialString)"
+}
+
+on_ac() { pmset -g batt 2>/dev/null | head -1 | grep -q "AC Power"; }
+
+# --- classification -----------------------------------------------------------
+
+# 0 = this adapter is a power bank, 1 = it is not.
+is_power_bank() {
+    local fp="$1" watts="$2" known
+    while IFS= read -r known; do
+        [ -n "$known" ] || continue
+        [ "$known" = "$fp" ] && return 0
+    done <<< "$BANK_FINGERPRINTS"
+
+    if [ -n "$BANK_MAX_WATTS" ] && [ -n "$watts" ] && [ "$watts" -le "$BANK_MAX_WATTS" ] 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# --- Low Power Mode -----------------------------------------------------------
+
+# Current setting, or empty when the key is unsupported/unset on this macOS.
+lpm_current() {
+    local v
+    v="$(pmset -g custom 2>/dev/null | awk '/lowpowermode/ {print $2; exit}')"
+    if [ -z "$v" ]; then
+        v="$(plutil -extract 'Battery Power'.LowPowerMode raw -o - \
+            /Library/Preferences/com.apple.PowerManagement.plist 2>/dev/null)"
+    fi
+    printf '%s' "$v"
+}
+
+lpm_set() {
+    local want="$1" have
+    [ -n "$want" ] || return 0
+    have="$(lpm_current)"
+    [ "$have" = "$want" ] && return 0
+    pmset -a lowpowermode "$want" || { log "pmset -a lowpowermode $want FAILED"; return 1; }
+    log "low power mode ${have:-?} -> $want"
+}
+
+# Remember the setting we found before we first overrode it, so disconnecting
+# restores the user's own preference rather than a hardcoded "off".
+state_save() { [ -f "$STATE" ] || printf '%s\n' "$(lpm_current)" > "$STATE" 2>/dev/null; }
+# Defaults to 0 when no state was saved, or when the saved value was empty
+# because lowpowermode was unreadable at the time — never returns "".
+state_restore_value() {
+    local v=""
+    [ -f "$STATE" ] && v="$(head -1 "$STATE")"
+    printf '%s' "${v:-0}"
+}
+state_clear() { rm -f "$STATE" 2>/dev/null; }
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+# --- the decision -------------------------------------------------------------
+
+apply() {
+    local raw fp watts
+    raw="$(adapter_raw)"
+
+    if ! on_ac || [ -z "$raw" ]; then
+        case "$ON_BATTERY" in
+            on)     state_save; lpm_set 1 ;;
+            off)    lpm_set 0; state_clear ;;
+            ignore) lpm_set "$(state_restore_value)"; state_clear ;;
+        esac
+        return
+    fi
+
+    fp="$(adapter_fingerprint "$raw")"
+    watts="$(printf '%s' "$raw" | adapter_field Watts)"
+
+    if is_power_bank "$fp" "$watts"; then
+        log "power bank attached ($fp)"
+        state_save
+        lpm_set 1
+    else
+        log "wall charger attached ($fp)"
+        lpm_set "$(state_restore_value)"
+        state_clear
+    fi
+}
+
+# --- subcommands --------------------------------------------------------------
+
+cmd_watch() {
+    apply
+    # pslog emits a line on every AC<->battery transition. Adapter details settle
+    # a moment after attach, so let the port controller finish negotiating.
+    pmset -g pslog 2>/dev/null | while IFS= read -r line; do
+        case "$line" in
+            *"Now drawing from"*) sleep 2; apply ;;
+        esac
+    done
+    log "pslog stream ended; exiting for launchd to restart"
+    exit 1
+}
+
+cmd_identify() {
+    local raw fp
+    raw="$(adapter_raw)"
+    if [ -z "$raw" ]; then
+        echo "No adapter attached. Plug in the power bank and run this again." >&2
+        return 1
+    fi
+    fp="$(adapter_fingerprint "$raw")"
+    echo "Attached adapter:"
+    echo "  watts:       $(printf '%s' "$raw" | adapter_field Watts)"
+    echo "  description: $(printf '%s' "$raw" | adapter_field Description)"
+    echo "  serial:      $(printf '%s' "$raw" | adapter_field SerialString)"
+    echo "  fingerprint: $fp"
+    echo
+    echo "To treat this adapter as a power bank, add to $CONFIG:"
+    echo "  BANK_FINGERPRINTS=\"\$BANK_FINGERPRINTS"
+    echo "$fp\""
+}
+
+cmd_status() {
+    local raw fp
+    raw="$(adapter_raw)"
+    fp="$(adapter_fingerprint "$raw" 2>/dev/null)"
+    echo "power source:    $(on_ac && echo 'AC Power' || echo 'Battery Power')"
+    echo "adapter:         ${fp:-none}"
+    local lpm; lpm="$(lpm_current)"
+    echo "low power mode:  ${lpm:-unsupported/unset}"
+    echo "saved state:     $([ -f "$STATE" ] && head -1 "$STATE" || echo 'none')"
+    echo "config:          $CONFIG $([ -f "$CONFIG" ] || echo '(missing)')"
+    launchctl print "system/$LABEL" >/dev/null 2>&1 &&
+        echo "daemon:          loaded" || echo "daemon:          not loaded"
+}
+
+# Confirm the platform actually supports what this tool depends on, BEFORE install.
+cmd_doctor() {
+    local rc=0 v
+    printf 'pmset present:            '
+    command -v pmset >/dev/null && echo ok || { echo MISSING; rc=1; }
+
+    printf 'pslog event stream:       '
+    if pmset -g batt >/dev/null 2>&1; then echo ok; else echo FAIL; rc=1; fi
+
+    printf 'AdapterDetails readable:  '
+    if ioreg -rn AppleSmartBattery >/dev/null 2>&1; then echo ok; else echo FAIL; rc=1; fi
+
+    printf 'lowpowermode supported:   '
+    v="$(lpm_current)"
+    if [ -n "$v" ]; then
+        echo "ok (currently $v)"
+    else
+        echo "UNKNOWN - key absent from 'pmset -g custom' and from"
+        echo "                          com.apple.PowerManagement.plist. It may simply be"
+        echo "                          unset. Verify with:"
+        echo "                            sudo pmset -a lowpowermode 1 && pmset -g custom | grep -i lowpower"
+        rc=2
+    fi
+
+    printf 'running as root:          '
+    [ "$(id -u)" -eq 0 ] && echo yes || echo "no (writes will fail; the daemon runs as root)"
+    return $rc
+}
+
+usage() {
+    cat <<USAGE
+powerbank-lpm $VERSION
+
+  identify   Print the attached adapter's fingerprint, for the config file
+  status     Show power source, adapter, Low Power Mode, daemon state
+  doctor     Check platform support before installing
+  watch      Event loop (this is what the LaunchDaemon runs)
+
+Config: $CONFIG
+USAGE
+}
+
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+# Allow tests to source the parsing/classification functions without dispatching.
+[ -n "${POWERBANK_LPM_LIB:-}" ] && return 0
+
+case "${1:-}" in
+    watch)    cmd_watch ;;
+    identify) cmd_identify ;;
+    status)   cmd_status ;;
+    doctor)   cmd_doctor ;;
+    -h|--help|help|"") usage ;;
+    *) echo "unknown command: $1" >&2; usage >&2; exit 64 ;;
+esac

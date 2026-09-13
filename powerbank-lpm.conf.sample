@@ -1,0 +1,18 @@
+# powerbank-lpm configuration — install to /usr/local/etc/powerbank-lpm.conf
+# Sourced as bash by the daemon running as root. Keep it root-owned and 0644.
+
+# Adapters to treat as power banks, one fingerprint per line.
+# Get a fingerprint by plugging the bank in and running: powerbank-lpm identify
+BANK_FINGERPRINTS="
+"
+
+# Fallback when no fingerprint matches: adapters at or below this wattage are
+# treated as power banks. Leave empty to match on fingerprints only.
+# Misclassifies low-wattage wall chargers — see the README before enabling.
+BANK_MAX_WATTS=""
+
+# Behaviour on the internal battery (no adapter at all):
+#   on     — force Low Power Mode
+#   off    — force it off
+#   ignore — restore whatever the setting was before a power bank was attached
+ON_BATTERY="ignore"

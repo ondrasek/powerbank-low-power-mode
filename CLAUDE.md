@@ -4,37 +4,65 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-macOS launchd job that enables Low Power Mode when the Mac is running off a **power bank** (USB-C PD battery pack) and restores the previous state when it is not. Repository is currently empty — no code has been committed yet. Update this file as the implementation lands.
+macOS LaunchDaemon that enables Low Power Mode when the Mac runs off a USB-C **power bank** and restores the previous setting otherwise. Pure bash; no build step.
 
-## Hard constraint: privilege
+```
+bin/powerbank-lpm   # everything: watch loop, identify, status, doctor
+launchd/*.plist     # LaunchDaemon definition
+install.sh          # sudo installer; runs `doctor` and refuses on failure (FORCE=1 overrides)
+tests/run.sh        # unit tests — no hardware, no root
+```
 
-`pmset` writes power settings and **requires root**. A user-level LaunchAgent (`~/Library/LaunchAgents`) cannot set Low Power Mode by itself. Only three viable designs; pick one explicitly and document the choice here:
+## Commands
 
-1. **LaunchDaemon** in `/Library/LaunchDaemons` running as root — simplest, but not user-level, needs an admin install step.
-2. **LaunchAgent + sudoers drop-in** in `/etc/sudoers.d/` with `NOPASSWD` scoped to the exact `pmset` invocation — keeps the watcher in user space; the sudoers file still needs root to install and is a privilege-escalation surface, so scope it to a single fixed command path, never a wildcard.
-3. **Split**: user LaunchAgent detects, privileged helper applies (LaunchDaemon + local socket/file trigger). Most work, cleanest separation.
+```bash
+./tests/run.sh                    # full test suite (~1s)
+./tests/run.sh 2>&1 | grep FAIL   # failures only; there is no single-test selector
+./bin/powerbank-lpm identify      # print attached adapter's fingerprint
+./bin/powerbank-lpm doctor        # platform support check
+sudo ./install.sh                 # install + bootstrap daemon
+sudo launchctl kickstart -k system/com.ondrasek.powerbank-low-power-mode   # reload after config edit
+```
 
-Do not write code that assumes a plain LaunchAgent can call `pmset -a` — it will fail silently in launchd logs.
+`ls` hangs under the Claude Code sandbox here — use `find`, `git status`, or `echo *`.
 
-## Platform facts (verified on this machine, macOS 26.5.2 / Apple Silicon)
+## Architecture
 
-- `pmset -g custom` does **not** list `lowpowermode` here, and `/Library/Preferences/com.apple.PowerManagement.plist` has no such key — the setting is unset, and `lowpowermode` is **undocumented in `man pmset` on macOS 26**. Verify `sudo pmset -b lowpowermode 1` actually takes effect on the target machine before building on it; on recent hardware Apple exposes Energy Mode (low/automatic/high) instead of a single boolean. Re-check with `pmset -g custom` after writing.
-- Power-source change events: `pmset -g pslog` streams a line on every AC↔Battery transition. This is the event source to drive the watcher (`KeepAlive` + read stdin loop), not `StartInterval` polling.
-- Current source, one-shot: `pmset -g batt` → `Now drawing from 'AC Power'` | `'Battery Power'`.
-- Adapter identity: `ioreg -rn AppleSmartBattery` → `AdapterDetails` dict, e.g. `{"Watts"=60,"AdapterVoltage"=20000,"FamilyCode"=...,"AdapterID"=0,"Description"="pd charger","IsWireless"=No}`. Apple first-party adapters additionally carry `Manufacturer`/`SerialString`; the third-party PD charger observed here carries neither.
+Single decision function, `apply()`, called once at startup and again on every line
+`pmset -g pslog` emits containing `Now drawing from`. Everything else is support:
+`adapter_raw` → `adapter_field` → `adapter_fingerprint` → `is_power_bank` → `lpm_set`.
 
-## The actual hard problem: identifying a power bank
+**State**: `/var/db/powerbank-lpm.state` holds the Low Power Mode value observed *before*
+this tool first overrode it. Disconnect restores that, never a hardcoded `0`. Anything
+touching `lpm_set` must preserve this — see `state_save`/`state_restore_value`.
 
-**There is no "this is a battery pack" bit in IOKit.** A power bank negotiates USB-C PD exactly like a wall charger. Workable discriminators, in descending reliability:
+**Testing**: sourcing `bin/powerbank-lpm` with `POWERBANK_LPM_LIB=1` set returns before
+command dispatch, exposing the pure functions. Keep new logic in functions that take
+their input as arguments so it stays reachable this way; hardware access belongs only in
+`adapter_raw`, `on_ac`, and `lpm_current`.
 
-1. **Fingerprint allowlist** — match on the `AdapterDetails` tuple (`Watts` + `FamilyCode` + `AdapterID`, plus `SerialString` when present) for the user's known power banks. Requires a user-editable config file and a `--identify` mode that prints the currently connected adapter's fingerprint so a bank can be enrolled.
-2. **Wattage threshold** — e.g. treat < 65 W as a bank. Cheap, but misclassifies low-wattage wall chargers and high-output banks. Only acceptable as a fallback with the threshold configurable.
+## Platform facts (verified on macOS 26.5.2, Apple Silicon)
 
-Never claim in docs or commit messages that detection is reliable by adapter type alone.
+- **BSD `sed` has no `\|` alternation.** A `sed`-based `AdapterDetails` parser fails
+  *silently* and yields an empty fingerprint, which then matches nothing. `adapter_field`
+  is written in `awk` for this reason — do not "simplify" it back to `sed`.
+- **`system_profiler SPPowerDataType` is useless for adapter identity here.** Its
+  `AC Charger Information` section reports only `Connected` and `Charging` — no wattage,
+  no ID, no manufacturer. Use `ioreg -rn AppleSmartBattery` → `AdapterDetails`.
+- `pmset -g pslog` streams a line per AC↔battery transition; this is the event source.
+  Adapter details settle ~1-2s after attach, hence the `sleep 2` before `apply`.
+- **`lowpowermode` is undocumented in `man pmset` on macOS 26** and absent from both
+  `pmset -g custom` and `com.apple.PowerManagement.plist` on the dev machine. `doctor`
+  reports this. It is not confirmed that `pmset -a lowpowermode 1` still works — do not
+  write docs or commit messages asserting it does.
+- Observed third-party adapter: `Watts=60, AdapterID=0, Description="pd charger"`, with
+  no `Manufacturer`/`SerialString`. Apple bricks do carry those.
 
-## Conventions once code exists
+## Constraints
 
-- Reverse-DNS label matching the plist filename, e.g. `com.ondrasek.powerbank-low-power-mode`.
-- Restore semantics: persist the pre-existing Low Power Mode value before overriding, and restore it on disconnect — do not hardcode "off".
-- Log to `~/Library/Logs/` (agent) or `/var/log/` (daemon) via the plist's `StandardOutPath`/`StandardErrorPath`; `launchctl print gui/$(id -u)/<label>` (or `system/<label>` for a daemon) is the primary debugging command.
-- Reloading after a plist edit: `launchctl bootout` then `bootstrap` — `launchctl load -w` is deprecated and silently keeps stale config.
+- `pmset` writes require root — a user LaunchAgent cannot do this. Daemon runs as root.
+  If revisiting the sudoers alternative, scope it to one exact command, never `/usr/bin/pmset`.
+- **There is no IOKit flag for "this is a power bank."** Detection is a user-curated
+  fingerprint allowlist, with a lossy wattage threshold as opt-in fallback. Never document
+  it as reliable adapter-type detection.
+- Use `launchctl bootout` + `bootstrap`, not deprecated `load -w` (silently keeps stale config).
