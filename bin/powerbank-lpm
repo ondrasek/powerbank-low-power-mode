@@ -1,36 +1,47 @@
 #!/bin/bash
-# powerbank-lpm — toggle macOS Low Power Mode based on which USB-C adapter is attached.
+# powerbank-lpm — toggle macOS Low Power Mode based on which USB-C source is attached.
 #
 # Runs as root from a LaunchDaemon (pmset writes require root). Event-driven via
 # `pmset -g pslog`; no polling.
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 LABEL="com.ondrasek.powerbank-low-power-mode"
 CONFIG="${POWERBANK_LPM_CONFIG:-/usr/local/etc/powerbank-lpm.conf}"
 STATE="${POWERBANK_LPM_STATE:-/var/db/powerbank-lpm.state}"
 
 # --- config defaults (overridable in $CONFIG) ---------------------------------
-# Newline-separated adapter fingerprints treated as power banks. See `identify`.
+# Primary mechanism: "pd" uses the USB-PD Unconstrained Power bit. "list" trusts
+# only the fingerprint lists below.
+DETECT_MODE="pd"
+# Require the source to also advertise Dual-Role Power (it can sink, i.e. recharge
+# itself) before calling it a power bank. Stricter, fewer false positives.
+REQUIRE_DUAL_ROLE="0"
+# Explicit overrides, one fingerprint per line, from `powerbank-lpm identify`.
 BANK_FINGERPRINTS=""
-# Fallback when no fingerprint matches: adapters at or below this wattage count
-# as power banks. Empty disables the fallback (fingerprints only).
+WALL_FINGERPRINTS=""
+# Last-resort wattage fallback. Off by default: wattage does NOT distinguish a
+# power bank from a wall charger of the same rating.
 BANK_MAX_WATTS=""
-# What to do when running on the internal battery: on | off | ignore
+# Behaviour on the internal battery: on | off | ignore
 ON_BATTERY="ignore"
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
 # --- adapter inspection -------------------------------------------------------
 
+on_ac() { pmset -g batt 2>/dev/null | head -1 | grep -q "AC Power"; }
+
 # Raw AdapterDetails dict, or empty when nothing is attached.
 adapter_raw() {
-    ioreg -rn AppleSmartBattery 2>/dev/null |
+    ioreg -rn AppleSmartBattery -w 0 2>/dev/null |
         sed -n 's/.*"AdapterDetails" = {\(.*\)}.*/\1/p' | head -1
 }
 
-# Pull one key out of an AdapterDetails dict read on stdin, first match wins.
+# Pull one key out of a dict read on stdin, first match wins.
 # Quoted and bare values both occur, e.g. "Watts"=60 and "Description"="pd charger".
 # Written in awk deliberately: BSD sed has no \| alternation, so a sed version
-# fails silently on macOS and yields an empty fingerprint.
+# fails silently on macOS and yields an empty field.
 adapter_field() {
     awk -v k="\"$1\"=" '
         { i = index($0, k); if (i == 0) exit
@@ -40,47 +51,131 @@ adapter_field() {
           exit }'
 }
 
-# Stable identity for an adapter. SerialString is absent on most third-party
-# chargers, so the tuple degrades to the electrical profile.
-adapter_fingerprint() {
-    local d="${1:-}"
-    [ -n "$d" ] || return 1
-    printf 'w=%s;id=%s;fc=%s;sn=%s\n' \
-        "$(printf '%s' "$d" | adapter_field Watts)" \
-        "$(printf '%s' "$d" | adapter_field AdapterID)" \
-        "$(printf '%s' "$d" | adapter_field FamilyCode)" \
-        "$(printf '%s' "$d" | adapter_field SerialString)"
+# --- USB-PD source capabilities ----------------------------------------------
+#
+# PortControllerPortPDO holds the Source Capabilities the attached source
+# advertised. CRITICAL: this array is NOT cleared on unplug — it persists from
+# the last negotiation. Select the port by live contract (MaxPower > 0), never by
+# "the PDO array is non-zero", or an unplugged charger reads as still attached.
+
+pd_port_line() {
+    ioreg -rn AppleSmartBattery -w 0 2>/dev/null | tr '{' '\n' |
+        awk '/"PortControllerPortPDO"/ && /"PortControllerMaxPower"=[1-9]/ { print; exit }'
 }
 
-on_ac() { pmset -g batt 2>/dev/null | head -1 | grep -q "AC Power"; }
+pd_pdo_list() {
+    printf '%s' "${1:-}" | sed -n 's/.*"PortControllerPortPDO"=(\([^)]*\)).*/\1/p'
+}
+
+# Decode one 32-bit PDO into a human-readable line.
+pd_decode_one() {
+    local raw=$1
+    local p32=$(( raw & 0xFFFFFFFF ))
+    local t=$(( (p32 >> 30) & 0x3 ))
+    case $t in
+        0) printf 'fixed    %6dmV %5dmA  dual_role_power=%d unconstrained_power=%d\n' \
+             "$(( ((p32 >> 10) & 0x3FF) * 50 ))" "$(( (p32 & 0x3FF) * 10 ))" \
+             "$(( (p32 >> 29) & 1 ))" "$(( (p32 >> 27) & 1 ))" ;;
+        1) printf 'battery  %6dmV-%dmV %dmW\n' \
+             "$(( ((p32 >> 10) & 0x3FF) * 50 ))" "$(( ((p32 >> 20) & 0x3FF) * 50 ))" "$(( (p32 & 0x3FF) * 250 ))" ;;
+        2) printf 'variable %6dmV-%dmV %dmA\n' \
+             "$(( ((p32 >> 10) & 0x3FF) * 50 ))" "$(( ((p32 >> 20) & 0x3FF) * 50 ))" "$(( (p32 & 0x3FF) * 10 ))" ;;
+        3) printf 'pps      %6dmV-%dmV %dmA\n' \
+             "$(( ((p32 >> 8) & 0xFF) * 100 ))" "$(( ((p32 >> 17) & 0xFF) * 100 ))" "$(( (p32 & 0x7F) * 50 ))" ;;
+    esac
+}
+
+pd_decode_all() {
+    local p
+    IFS=, read -ra _pdos <<< "${1:-}"
+    for p in "${_pdos[@]:-}"; do
+        [ -n "$p" ] && [ "$p" != "0" ] && pd_decode_one "$p"
+    done
+}
+
+# Per USB-PD spec the capability flags live in the first (vSafe5V fixed) PDO.
+# bit 29 Dual-Role Power, bit 27 Unconstrained Power.
+# Prints "<dual_role> <unconstrained>", or nothing if there are no PDOs.
+pd_flags() {
+    local list="${1:-}" first p32
+    first="${list%%,*}"
+    [ -n "$first" ] && [ "$first" != "0" ] || return 1
+    p32=$(( first & 0xFFFFFFFF ))
+    [ $(( (p32 >> 30) & 0x3 )) -eq 0 ] || return 1   # must be a Fixed Supply PDO
+    printf '%d %d' "$(( (p32 >> 29) & 1 ))" "$(( (p32 >> 27) & 1 ))"
+}
+
+# Identity: the full advertised capability set, which differs between two
+# same-wattage sources far more reliably than wattage alone.
+pd_pdo_hash() {
+    local list="${1:-}"
+    [ -n "$list" ] || return 1
+    printf '%s' "$list" | tr -d ' ' | md5 -q 2>/dev/null | cut -c1-12
+}
+
+adapter_fingerprint() {
+    local d="${1:-}" pdo="${2:-}" watts sn hash
+    watts="$(printf '%s' "$d" | adapter_field Watts)"
+    sn="$(printf '%s' "$d" | adapter_field SerialString)"
+    [ -n "$watts" ] || return 1
+    hash="$(pd_pdo_hash "$pdo")" || hash="none"
+    printf 'w=%s;pdo=%s;sn=%s\n' "$watts" "$hash" "$sn"
+}
 
 # --- classification -----------------------------------------------------------
 
-# 0 = this adapter is a power bank, 1 = it is not.
-is_power_bank() {
-    local fp="$1" watts="$2" known
-    while IFS= read -r known; do
-        [ -n "$known" ] || continue
-        [ "$known" = "$fp" ] && return 0
-    done <<< "$BANK_FINGERPRINTS"
+in_list() {
+    local fp="$1" entry
+    while IFS= read -r entry; do
+        entry="${entry// /}"
+        [ -n "$entry" ] || continue
+        [ "$entry" = "$fp" ] && return 0
+    done <<< "$2"
+    return 1
+}
+
+# 0 = power bank, 1 = not. Echoes the reason on stdout.
+classify() {
+    local fp="$1" watts="$2" flags="$3" drp unc
+
+    if in_list "$fp" "$WALL_FINGERPRINTS"; then echo "allowlisted as wall charger"; return 1; fi
+    if in_list "$fp" "$BANK_FINGERPRINTS"; then echo "allowlisted as power bank"; return 0; fi
+
+    if [ "$DETECT_MODE" = "pd" ] && [ -n "$flags" ]; then
+        drp="${flags%% *}"; unc="${flags##* }"
+        if [ "$unc" = "0" ]; then
+            if [ "$REQUIRE_DUAL_ROLE" = "1" ] && [ "$drp" != "1" ]; then
+                echo "unconstrained_power=0 but no dual-role power; REQUIRE_DUAL_ROLE=1"
+                return 1
+            fi
+            echo "USB-PD unconstrained_power=0 (battery-backed source)"
+            return 0
+        fi
+        echo "USB-PD unconstrained_power=1 (mains-backed source)"
+        return 1
+    fi
 
     if [ -n "$BANK_MAX_WATTS" ] && [ -n "$watts" ] && [ "$watts" -le "$BANK_MAX_WATTS" ] 2>/dev/null; then
+        echo "wattage fallback: ${watts}W <= ${BANK_MAX_WATTS}W"
         return 0
     fi
+    echo "no rule matched"
     return 1
 }
 
 # --- Low Power Mode -----------------------------------------------------------
-
-# Current setting, or empty when the key is unsupported/unset on this macOS.
+#
+# Asymmetric on purpose: the WRITE key is `lowpowermode`, but macOS 26 reports it
+# back as `powermode` in `pmset -g custom`. Matching only /lowpowermode/ on read
+# silently never matches.
+# Second asymmetry: pmset OMITS the key entirely when the mode is off. Absent
+# therefore means 0, not "unsupported" — treating absent as unknown makes every
+# save/restore decision wrong.
 lpm_current() {
     local v
-    v="$(pmset -g custom 2>/dev/null | awk '/lowpowermode/ {print $2; exit}')"
-    if [ -z "$v" ]; then
-        v="$(plutil -extract 'Battery Power'.LowPowerMode raw -o - \
-            /Library/Preferences/com.apple.PowerManagement.plist 2>/dev/null)"
-    fi
-    printf '%s' "$v"
+    v="$(pmset -g custom 2>/dev/null |
+        awk '$1 == "powermode" || $1 == "lowpowermode" { print $2; exit }')"
+    printf '%s' "${v:-0}"
 }
 
 lpm_set() {
@@ -92,11 +187,8 @@ lpm_set() {
     log "low power mode ${have:-?} -> $want"
 }
 
-# Remember the setting we found before we first overrode it, so disconnecting
-# restores the user's own preference rather than a hardcoded "off".
 state_save() { [ -f "$STATE" ] || printf '%s\n' "$(lpm_current)" > "$STATE" 2>/dev/null; }
-# Defaults to 0 when no state was saved, or when the saved value was empty
-# because lowpowermode was unreadable at the time — never returns "".
+# Defaults to 0 when nothing was saved, or the saved value was empty — never "".
 state_restore_value() {
     local v=""
     [ -f "$STATE" ] && v="$(head -1 "$STATE")"
@@ -104,15 +196,12 @@ state_restore_value() {
 }
 state_clear() { rm -f "$STATE" 2>/dev/null; }
 
-log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-
 # --- the decision -------------------------------------------------------------
 
 apply() {
-    local raw fp watts
-    raw="$(adapter_raw)"
+    local raw pdo flags fp watts reason
 
-    if ! on_ac || [ -z "$raw" ]; then
+    if ! on_ac; then
         case "$ON_BATTERY" in
             on)     state_save; lpm_set 1 ;;
             off)    lpm_set 0; state_clear ;;
@@ -121,15 +210,18 @@ apply() {
         return
     fi
 
-    fp="$(adapter_fingerprint "$raw")"
+    raw="$(adapter_raw)"
+    pdo="$(pd_pdo_list "$(pd_port_line)")"
+    flags="$(pd_flags "$pdo")" || flags=""
     watts="$(printf '%s' "$raw" | adapter_field Watts)"
+    fp="$(adapter_fingerprint "$raw" "$pdo")" || fp="unknown"
 
-    if is_power_bank "$fp" "$watts"; then
-        log "power bank attached ($fp)"
+    if reason="$(classify "$fp" "$watts" "$flags")"; then
+        log "power bank: $fp — $reason"
         state_save
         lpm_set 1
     else
-        log "wall charger attached ($fp)"
+        log "wall power: $fp — $reason"
         lpm_set "$(state_restore_value)"
         state_clear
     fi
@@ -139,8 +231,8 @@ apply() {
 
 cmd_watch() {
     apply
-    # pslog emits a line on every AC<->battery transition. Adapter details settle
-    # a moment after attach, so let the port controller finish negotiating.
+    # pslog emits a line on every AC<->battery transition. PD contract details
+    # settle a moment after attach, so let the port controller finish negotiating.
     pmset -g pslog 2>/dev/null | while IFS= read -r line; do
         case "$line" in
             *"Now drawing from"*) sleep 2; apply ;;
@@ -151,61 +243,81 @@ cmd_watch() {
 }
 
 cmd_identify() {
-    local raw fp
-    raw="$(adapter_raw)"
-    if [ -z "$raw" ]; then
-        echo "No adapter attached. Plug in the power bank and run this again." >&2
+    local raw pdo flags fp
+    if ! on_ac; then
+        echo "Not running on AC — plug the source in and run this again." >&2
+        echo "(PD data persists from the last negotiation and would be stale.)" >&2
         return 1
     fi
-    fp="$(adapter_fingerprint "$raw")"
-    echo "Attached adapter:"
+    raw="$(adapter_raw)"
+    pdo="$(pd_pdo_list "$(pd_port_line)")"
+    flags="$(pd_flags "$pdo")" || flags=""
+    fp="$(adapter_fingerprint "$raw" "$pdo")" || { echo "No adapter details available." >&2; return 1; }
+
+    echo "Attached source:"
     echo "  watts:       $(printf '%s' "$raw" | adapter_field Watts)"
     echo "  description: $(printf '%s' "$raw" | adapter_field Description)"
     echo "  serial:      $(printf '%s' "$raw" | adapter_field SerialString)"
     echo "  fingerprint: $fp"
     echo
-    echo "To treat this adapter as a power bank, add to $CONFIG:"
-    echo "  BANK_FINGERPRINTS=\"\$BANK_FINGERPRINTS"
-    echo "$fp\""
+    if [ -n "$pdo" ]; then
+        echo "Advertised USB-PD source capabilities:"
+        pd_decode_all "$pdo" | sed 's/^/  /'
+        echo
+        echo "  verdict: $(classify "$fp" "$(printf '%s' "$raw" | adapter_field Watts)" "$flags"; \
+            [ $? -eq 0 ] && echo '  => POWER BANK' || echo '  => WALL POWER')"
+    else
+        echo "No live PD contract found — this source may not speak USB-PD."
+        echo "Fall back to an explicit fingerprint entry."
+    fi
+    echo
+    echo "To force a classification, add the fingerprint to BANK_FINGERPRINTS or"
+    echo "WALL_FINGERPRINTS in $CONFIG:"
+    echo "$fp"
 }
 
 cmd_status() {
-    local raw fp
+    local raw pdo fp lpm
     raw="$(adapter_raw)"
-    fp="$(adapter_fingerprint "$raw" 2>/dev/null)"
+    pdo="$(pd_pdo_list "$(pd_port_line)")"
+    fp="$(adapter_fingerprint "$raw" "$pdo" 2>/dev/null)" || fp=""
+    lpm="$(lpm_current)"
     echo "power source:    $(on_ac && echo 'AC Power' || echo 'Battery Power')"
-    echo "adapter:         ${fp:-none}"
-    local lpm; lpm="$(lpm_current)"
-    echo "low power mode:  ${lpm:-unsupported/unset}"
+    echo "source:          ${fp:-none}"
+    echo "pd contract:     ${pdo:-none (no live contract)}"
+    echo "low power mode:  $lpm"
     echo "saved state:     $([ -f "$STATE" ] && head -1 "$STATE" || echo 'none')"
     echo "config:          $CONFIG $([ -f "$CONFIG" ] || echo '(missing)')"
     launchctl print "system/$LABEL" >/dev/null 2>&1 &&
         echo "daemon:          loaded" || echo "daemon:          not loaded"
 }
 
-# Confirm the platform actually supports what this tool depends on, BEFORE install.
 cmd_doctor() {
     local rc=0 v
     printf 'pmset present:            '
     command -v pmset >/dev/null && echo ok || { echo MISSING; rc=1; }
 
-    printf 'pslog event stream:       '
-    if pmset -g batt >/dev/null 2>&1; then echo ok; else echo FAIL; rc=1; fi
-
     printf 'AdapterDetails readable:  '
-    if ioreg -rn AppleSmartBattery >/dev/null 2>&1; then echo ok; else echo FAIL; rc=1; fi
+    ioreg -rn AppleSmartBattery >/dev/null 2>&1 && echo ok || { echo FAIL; rc=1; }
 
-    printf 'lowpowermode supported:   '
+    printf 'low power mode:           '
     v="$(lpm_current)"
-    if [ -n "$v" ]; then
-        echo "ok (currently $v)"
-    else
-        echo "UNKNOWN - key absent from 'pmset -g custom' and from"
-        echo "                          com.apple.PowerManagement.plist. It may simply be"
-        echo "                          unset. Verify with:"
-        echo "                            sudo pmset -a lowpowermode 1 && pmset -g custom | grep -i lowpower"
+    echo "currently $v (write key: lowpowermode, read key: powermode)"
+
+    printf 'PD capabilities visible:  '
+    if [ -n "$(pd_pdo_list "$(pd_port_line)")" ]; then echo ok
+    elif on_ac; then echo "none — attached source has no live PD contract; use fingerprints"; rc=2
+    else echo "n/a (on battery — re-run on AC)"; fi
+
+    printf 'pre-existing LPM state:   '
+    if [ "$v" != "0" ] && [ -n "$v" ] && [ ! -f "$STATE" ]; then
+        echo "WARNING: Low Power Mode is currently ON ($v)."
+        echo "                          That value will be saved as your 'normal' setting and"
+        echo "                          restored whenever a power bank is NOT attached."
+        echo "                          Set it to what you want as normal first:"
+        echo "                            sudo pmset -a lowpowermode 0"
         rc=2
-    fi
+    else echo ok; fi
 
     printf 'running as root:          '
     [ "$(id -u)" -eq 0 ] && echo yes || echo "no (writes will fail; the daemon runs as root)"
@@ -216,8 +328,8 @@ usage() {
     cat <<USAGE
 powerbank-lpm $VERSION
 
-  identify   Print the attached adapter's fingerprint, for the config file
-  status     Show power source, adapter, Low Power Mode, daemon state
+  identify   Decode the attached source's USB-PD capabilities and fingerprint
+  status     Power source, PD contract, Low Power Mode, daemon state
   doctor     Check platform support before installing
   watch      Event loop (this is what the LaunchDaemon runs)
 
@@ -227,7 +339,7 @@ USAGE
 
 [ -f "$CONFIG" ] && . "$CONFIG"
 
-# Allow tests to source the parsing/classification functions without dispatching.
+# Allow tests to source the pure functions without dispatching.
 [ -n "${POWERBANK_LPM_LIB:-}" ] && return 0
 
 case "${1:-}" in

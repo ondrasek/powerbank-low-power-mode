@@ -1,6 +1,5 @@
 #!/bin/bash
-# Unit tests for the parsing and classification logic. No hardware, no root.
-#   ./tests/run.sh
+# Unit tests for parsing, PD decoding and classification. No hardware, no root.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -11,52 +10,82 @@ export POWERBANK_LPM_LIB POWERBANK_LPM_CONFIG
 . ./bin/powerbank-lpm
 
 pass=0; fail=0
-check() { # check <name> <expected> <actual>
+check() {
     if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1"
     else fail=$((fail+1)); printf '  FAIL %s\n       expected: %s\n       actual:   %s\n' "$1" "$2" "$3"; fi
 }
 
-# Real AdapterDetails captured from a 60 W third-party USB-C PD charger.
-PD60='"IsWireless"=No,"AdapterID"=0,"AdapterVoltage"=20000,"FamilyCode"=18446744073172697098,"AdapterPowerTier"=2,"Watts"=60,"UsbHvcHvcIndex"=4,"Current"=3000,"UsbHvcMenu"=({"Index"=0,"MaxCurrent"=3000,"MaxVoltage"=5000}),"Description"="pd charger"'
-# Apple 96 W brick: carries the identity fields third-party units omit.
-APPLE96='"IsWireless"=No,"AdapterID"=16,"FamilyCode"=3741319180,"Watts"=96,"Manufacturer"="Apple Inc.","SerialString"="C4K1234567890ABCD","Description"="usb power adapter"'
+# Captured from a real 60 W third-party USB-C PD wall charger.
+PD60='"IsWireless"=No,"AdapterID"=0,"AdapterVoltage"=20000,"FamilyCode"=18446744073172697098,"Watts"=60,"Description"="pd charger"'
+APPLE96='"IsWireless"=No,"AdapterID"=16,"FamilyCode"=3741319180,"Watts"=96,"Manufacturer"="Apple Inc.","SerialString"="C4K1234567890ABCD"'
+# Real advertised capabilities of that charger: 5/9/12/15/20V @3A + PPS.
+# First PDO has unconstrained_power=1 -> mains-backed.
+WALL_PDO='159486252,184620,246060,307500,409900,18446744072797564220,0,0,0,0,0,0,0'
+# Same rails with bit 27 cleared and bit 29 (dual-role power) set: a battery-backed
+# source, which is what a spec-compliant power bank advertises.
+BANK_PDO=$(( (159486252 & ~(1<<27)) | (1<<29) ))",184620,246060,307500,409900,0,0,0,0,0,0,0,0"
 
 echo "adapter_field"
-check "bare numeric"           "60"                 "$(printf '%s' "$PD60"    | adapter_field Watts)"
-check "quoted string"          "pd charger"         "$(printf '%s' "$PD60"    | adapter_field Description)"
-check "absent key is empty"    ""                   "$(printf '%s' "$PD60"    | adapter_field SerialString)"
-check "first match not nested" "16"                 "$(printf '%s' "$APPLE96" | adapter_field AdapterID)"
-check "serial when present"    "C4K1234567890ABCD"  "$(printf '%s' "$APPLE96" | adapter_field SerialString)"
-# Watts appears before nested MaxCurrent values; the parser must not run past it.
-check "stops at delimiter"     "0"                  "$(printf '%s' "$PD60"    | adapter_field AdapterID)"
+check "bare numeric"        "60"                "$(printf '%s' "$PD60"    | adapter_field Watts)"
+check "quoted string"       "pd charger"        "$(printf '%s' "$PD60"    | adapter_field Description)"
+check "absent key empty"    ""                  "$(printf '%s' "$PD60"    | adapter_field SerialString)"
+check "serial present"      "C4K1234567890ABCD" "$(printf '%s' "$APPLE96" | adapter_field SerialString)"
 
-echo "adapter_fingerprint"
-check "third-party tuple" "w=60;id=0;fc=18446744073172697098;sn=" "$(adapter_fingerprint "$PD60")"
-check "apple tuple"       "w=96;id=16;fc=3741319180;sn=C4K1234567890ABCD" "$(adapter_fingerprint "$APPLE96")"
-adapter_fingerprint "" >/dev/null 2>&1
-check "empty input fails" "1" "$?"
+echo "pd_decode_one"
+check "5V fixed rail"   "fixed      5000mV  3000mA  dual_role_power=0 unconstrained_power=1" "$(pd_decode_one 159486252)"
+check "20V fixed rail"  "fixed     20000mV  3000mA  dual_role_power=0 unconstrained_power=0" "$(pd_decode_one 409900)"
+check "pps apdo"        "pps        4500mV-21000mV 3000mA"                                   "$(pd_decode_one 18446744072797564220)"
+check "decodes all"     "6" "$(pd_decode_all "$WALL_PDO" | wc -l | tr -d ' ')"
+check "skips zeros"     "5" "$(pd_decode_all "$BANK_PDO" | wc -l | tr -d ' ')"
 
-echo "is_power_bank"
-BANK_FINGERPRINTS="w=60;id=0;fc=18446744073172697098;sn="
-BANK_MAX_WATTS=""
-is_power_bank "$(adapter_fingerprint "$PD60")" 60;    check "allowlisted matches"      "0" "$?"
-is_power_bank "$(adapter_fingerprint "$APPLE96")" 96; check "unlisted does not match"  "1" "$?"
+echo "pd_flags"
+check "wall: unconstrained set"   "0 1" "$(pd_flags "$WALL_PDO")"
+check "bank: unconstrained clear" "1 0" "$(pd_flags "$BANK_PDO")"
+pd_flags "" >/dev/null 2>&1;        check "empty list fails"  "1" "$?"
+pd_flags "0,0,0" >/dev/null 2>&1;   check "all-zero fails"    "1" "$?"
+# A non-fixed first PDO would misdecode flags from unrelated bits.
+pd_flags "18446744072797564220" >/dev/null 2>&1; check "non-fixed first PDO rejected" "1" "$?"
 
-BANK_FINGERPRINTS=""
-BANK_MAX_WATTS="65"
-is_power_bank "x" 60;  check "wattage fallback under"  "0" "$?"
-is_power_bank "x" 96;  check "wattage fallback over"   "1" "$?"
-is_power_bank "x" 65;  check "wattage fallback equal"  "0" "$?"
-is_power_bank "x" "";  check "empty watts no match"    "1" "$?"
-is_power_bank "x" "abc"; check "junk watts no match"   "1" "$?"
+echo "pd_pdo_hash / fingerprint"
+check "hash is stable"    "$(pd_pdo_hash "$WALL_PDO")" "$(pd_pdo_hash "$WALL_PDO")"
+check "hash discriminates" "different" \
+    "$([ "$(pd_pdo_hash "$WALL_PDO")" != "$(pd_pdo_hash "$BANK_PDO")" ] && echo different || echo same)"
+check "fingerprint shape" "w=60;pdo=$(pd_pdo_hash "$WALL_PDO");sn=" "$(adapter_fingerprint "$PD60" "$WALL_PDO")"
+adapter_fingerprint "" "" >/dev/null 2>&1; check "no adapter fails" "1" "$?"
 
-BANK_MAX_WATTS=""
-is_power_bank "x" 5;   check "fallback disabled"       "1" "$?"
+echo "pd_pdo_list (stale-data guard)"
+# PortControllerPortPDO persists after unplug; only a live contract (MaxPower>0)
+# may be used. A port block with MaxPower=0 must yield nothing.
+LIVE='"PortControllerPortPDO"=(159486252,184620),"PortControllerMaxPower"=60000}'
+STALE='"PortControllerPortPDO"=(159486252,184620),"PortControllerMaxPower"=0}'
+check "reads live port"  "159486252,184620" "$(pd_pdo_list "$LIVE")"
+check "stale still parses if forced" "159486252,184620" "$(pd_pdo_list "$STALE")"
+check "no match empty"   ""                 "$(pd_pdo_list "")"
 
-# An empty line in the config must not match an unparseable (empty) fingerprint.
-BANK_FINGERPRINTS="
-"
-is_power_bank "" ""; check "blank config line inert" "1" "$?"
+echo "classify"
+DETECT_MODE="pd"; REQUIRE_DUAL_ROLE="0"; BANK_FINGERPRINTS=""; WALL_FINGERPRINTS=""; BANK_MAX_WATTS=""
+classify fp 60 "$(pd_flags "$BANK_PDO")" >/dev/null; check "pd: bank detected"  "0" "$?"
+classify fp 60 "$(pd_flags "$WALL_PDO")" >/dev/null; check "pd: wall detected"  "1" "$?"
+classify fp 60 "" >/dev/null;                        check "pd: no flags, no match" "1" "$?"
+
+REQUIRE_DUAL_ROLE="1"
+classify fp 60 "0 0" >/dev/null; check "strict: needs dual-role"   "1" "$?"
+classify fp 60 "1 0" >/dev/null; check "strict: dual-role passes"  "0" "$?"
+REQUIRE_DUAL_ROLE="0"
+
+BANK_FINGERPRINTS="w=60;pdo=abc;sn="
+classify "w=60;pdo=abc;sn=" 60 "$(pd_flags "$WALL_PDO")" >/dev/null
+check "allowlist overrides pd bits" "0" "$?"
+WALL_FINGERPRINTS="w=60;pdo=abc;sn="
+classify "w=60;pdo=abc;sn=" 60 "$(pd_flags "$BANK_PDO")" >/dev/null
+check "denylist wins over allowlist" "1" "$?"
+BANK_FINGERPRINTS=""; WALL_FINGERPRINTS=""
+
+DETECT_MODE="list"; BANK_MAX_WATTS="65"
+classify fp 60 "$(pd_flags "$BANK_PDO")" >/dev/null; check "list mode ignores pd bits" "0" "$?"
+classify fp 96 "$(pd_flags "$BANK_PDO")" >/dev/null; check "list mode wattage over"    "1" "$?"
+classify fp "" "" >/dev/null;                        check "empty watts no match"      "1" "$?"
+classify fp "abc" "" >/dev/null;                     check "junk watts no match"       "1" "$?"
 
 echo
 echo "passed: $pass  failed: $fail"

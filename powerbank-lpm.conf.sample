@@ -1,18 +1,30 @@
 # powerbank-lpm configuration — install to /usr/local/etc/powerbank-lpm.conf
-# Sourced as bash by the daemon running as root. Keep it root-owned and 0644.
+# Sourced as bash by the root daemon. Keep it root-owned and 0644.
 
-# Adapters to treat as power banks, one fingerprint per line.
-# Get a fingerprint by plugging the bank in and running: powerbank-lpm identify
+# Detection mechanism:
+#   pd   — use the USB-PD "Unconstrained Power" bit the source advertises.
+#          Spec-defined: a source sets it when backed by mains, clears it when
+#          backed by a limited internal supply (i.e. a battery). This is the
+#          only semantic "am I a power bank" signal macOS exposes.
+#   list — ignore PD bits; trust only the fingerprint lists below.
+DETECT_MODE="pd"
+
+# Also require the source to advertise Dual-Role Power (it can sink, i.e. it can
+# recharge itself) before treating it as a power bank. Stricter; set to 1 if a
+# wall charger with sloppy firmware is being misdetected.
+REQUIRE_DUAL_ROLE="0"
+
+# Explicit overrides. Get a fingerprint with: powerbank-lpm identify
+# One per line. WALL_FINGERPRINTS wins over BANK_FINGERPRINTS, and both win over
+# the PD bits — use these when a device's firmware reports the wrong flags.
 BANK_FINGERPRINTS="
 "
+WALL_FINGERPRINTS="
+"
 
-# Fallback when no fingerprint matches: adapters at or below this wattage are
-# treated as power banks. Leave empty to match on fingerprints only.
-# Misclassifies low-wattage wall chargers — see the README before enabling.
+# Last-resort fallback, only consulted in list mode. Wattage does NOT reliably
+# separate a power bank from a wall charger of the same rating. Leave empty.
 BANK_MAX_WATTS=""
 
-# Behaviour on the internal battery (no adapter at all):
-#   on     — force Low Power Mode
-#   off    — force it off
-#   ignore — restore whatever the setting was before a power bank was attached
+# Behaviour with no adapter attached: on | off | ignore (restore prior setting)
 ON_BATTERY="ignore"
