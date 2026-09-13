@@ -24,8 +24,6 @@ sudo ./install.sh                 # install + bootstrap daemon
 sudo launchctl kickstart -k system/com.ondrasek.powerbank-low-power-mode   # reload after config edit
 ```
 
-`ls` hangs under the Claude Code sandbox here — use `find`, `git status`, or `echo *`.
-
 ## Architecture
 
 Single decision function, `apply()`, called once at startup and again on every line
