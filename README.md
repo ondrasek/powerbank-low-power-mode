@@ -29,6 +29,19 @@ identity to enrol once, not as a brand test. Enrol with `BANK_DEVICES` / `WALL_D
 `identify` prints a hash of the full advertised rail set plus PPS range — far more
 discriminating than wattage, since two 100 W sources with different rails differ.
 
+### Measured devices
+
+| Source | vid:pid | Watts | `unconstrained_power` | `dual_role_power` | ufp/dfp product type |
+| --- | --- | --- | --- | --- | --- |
+| Anker power bank | `04b4:f665` (Cypress) | 100 | **1** | 0 | 3 / 3 |
+| USB-C hub + wall power | `2109:0108` (VIA Labs) | 50 | 1 | **1** | 2 / 0 |
+| 60 W PD wall charger | not captured | 60 | 1 | 0 | — |
+
+vid:pid separates them cleanly, and the identity node refreshes on swap rather than
+reporting the previous source. Every inferred signal fails on this sample:
+`unconstrained_power` is 1 for all three, and `dual_role_power` is **backwards** — the
+mains-powered hub sets it, the battery-powered bank does not.
+
 ### What does not work
 
 - **Wattage.** A 100 W bank and a 100 W wall charger are identical on that axis.
@@ -36,9 +49,11 @@ discriminating than wattage, since two 100 W sources with different rails differ
   `Connected` and `Charging` — no wattage, no ID, no manufacturer.
 - **The USB-PD "Unconstrained Power" bit**, tempting as it looks. The spec defines bit 27
   of the first Fixed PDO as *cleared* when the source runs off a limited internal supply,
-  i.e. a battery. A real 100 W Anker power bank sets it to **1**, exactly like a wall
-  charger. The bit is available as opt-in `USE_PD_UNCONSTRAINED` but is **off by default**
+  i.e. a battery. A real 100 W Anker power bank sets it to **1**, exactly like mains. The bit is available as opt-in `USE_PD_UNCONSTRAINED` but is **off by default**
   because it is demonstrably unreliable on real hardware.
+- **Dual-Role Power** (bit 29), offered here as `REQUIRE_DUAL_ROLE`. It is inverted in
+  practice: the mains-powered hub advertises it, the power bank does not. Kept only
+  because a different pair of devices might behave as the spec suggests.
 - **PD product-type fields.** The ID Header VDO reports `ufp_product_type=3` (PSD) and
   `dfp_product_type=3` (Power Brick) for the bank. There is no "power bank" product type
   in the spec.

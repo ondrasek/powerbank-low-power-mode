@@ -60,8 +60,13 @@ Detection:
   Power**, spec-defined as 0 for a battery-backed source. **Measured: a real 100 W Anker
   power bank reports 1**, identical to a wall charger. The bit is opt-in
   (`USE_PD_UNCONSTRAINED`) and off by default — do not re-promote it to primary.
+- **Dual-Role Power (bit 29) is inverted in practice**: measured `1` on a mains-powered
+  USB-C hub and `0` on the battery-powered bank. `REQUIRE_DUAL_ROLE` is kept but must not
+  be assumed to point the way the spec implies.
 - ID Header VDO product types are also useless: the bank reports `ufp_product_type=3` (PSD)
   and `dfp_product_type=3` (Power Brick). The spec has no "power bank" type.
+- Measured devices: Anker 100 W bank `04b4:f665`, USB-C hub on wall power `2109:0108`.
+  vid:pid separates them; the identity node refreshes on swap (verified, not assumed).
 - **`PortControllerPortPDO` is not cleared on unplug.** It persists from the last
   negotiation. Select the port by live contract (`PortControllerMaxPower > 0`). Selecting
   "the port whose PDO array is non-zero" reports unplugged chargers as attached.
