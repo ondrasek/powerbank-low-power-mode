@@ -11,15 +11,18 @@ CONFIG="${POWERBANK_LPM_CONFIG:-/usr/local/etc/powerbank-lpm.conf}"
 STATE="${POWERBANK_LPM_STATE:-/var/db/powerbank-lpm.state}"
 
 # --- config defaults (overridable in $CONFIG) ---------------------------------
-# Primary mechanism: "pd" uses the USB-PD Unconstrained Power bit. "list" trusts
-# only the fingerprint lists below.
-DETECT_MODE="pd"
-# Require the source to also advertise Dual-Role Power (it can sink, i.e. recharge
-# itself) before calling it a power bank. Stricter, fewer false positives.
-REQUIRE_DUAL_ROLE="0"
-# Explicit overrides, one fingerprint per line, from `powerbank-lpm identify`.
+# Primary mechanism: USB-PD Discover Identity vid:pid, one per line, hex.
+# Get them from `powerbank-lpm identify`.
+BANK_DEVICES=""
+WALL_DEVICES=""
+# Fallback identity for sources that answer no Discover Identity.
 BANK_FINGERPRINTS=""
 WALL_FINGERPRINTS=""
+# Opt-in: trust the USB-PD Unconstrained Power bit (mains-backed = 1).
+# OFF by default - it is spec-defined but real power banks misreport it.
+USE_PD_UNCONSTRAINED="0"
+# Only consulted alongside the bit above.
+REQUIRE_DUAL_ROLE="0"
 # Last-resort wattage fallback. Off by default: wattage does NOT distinguish a
 # power bank from a wall charger of the same rating.
 BANK_MAX_WATTS=""
@@ -105,6 +108,38 @@ pd_flags() {
     printf '%d %d' "$(( (p32 >> 29) & 1 ))" "$(( (p32 >> 27) & 1 ))"
 }
 
+# --- USB-PD Discover Identity -------------------------------------------------
+#
+# The source's own VID/PID, from its Discover Identity response. Lives on the SOP
+# node (SOP = the attached port partner; SOP' would be the cable's e-marker, a
+# different device entirely). This node exists only while a source is attached,
+# so unlike PortControllerPortPDO it does not go stale.
+
+pd_identity_raw() {
+    ioreg -rc IOPortTransportComponentCCUSBPDSOP -w 0 2>/dev/null | grep -m1 '"Metadata"'
+}
+
+# Prints "vid:pid" in lowercase hex, or fails when the source answers no identity.
+pd_device_id() {
+    local meta="${1:-}" vid pid
+    vid="$(printf '%s' "$meta" | adapter_field 'Vendor ID')"
+    pid="$(printf '%s' "$meta" | adapter_field 'Product ID')"
+    [ -n "$vid" ] && [ -n "$pid" ] || return 1
+    printf '%04x:%04x' "$vid" "$pid"
+}
+
+# Decode the ID Header VDO product-type fields, for `identify` output only.
+# ioreg prints VDO bytes little-endian, e.g. <b4048019> is 0x198004b4.
+pd_id_header() {
+    local meta="${1:-}" le v
+    le="$(printf '%s' "$meta" | sed -n 's/.*"VDOs"=(<\([0-9a-f]*\)>.*/\1/p')"
+    [ ${#le} -eq 8 ] || return 1
+    v=$(( 0x${le:6:2}${le:4:2}${le:2:2}${le:0:2} ))
+    printf 'ufp_product_type=%d dfp_product_type=%d modal=%d usb_host=%d usb_device=%d' \
+        "$(( (v >> 27) & 7 ))" "$(( (v >> 23) & 7 ))" "$(( (v >> 26) & 1 ))" \
+        "$(( (v >> 31) & 1 ))" "$(( (v >> 30) & 1 ))"
+}
+
 # Identity: the full advertised capability set, which differs between two
 # same-wattage sources far more reliably than wattage alone.
 pd_pdo_hash() {
@@ -135,13 +170,19 @@ in_list() {
 }
 
 # 0 = power bank, 1 = not. Echoes the reason on stdout.
+# Precedence: explicit device id, then explicit fingerprint, then inferred bits.
+# Explicit always wins - real devices misreport the inferred fields.
 classify() {
-    local fp="$1" watts="$2" flags="$3" drp unc
+    local fp="$1" dev="$2" watts="$3" flags="$4" drp unc
 
-    if in_list "$fp" "$WALL_FINGERPRINTS"; then echo "allowlisted as wall charger"; return 1; fi
-    if in_list "$fp" "$BANK_FINGERPRINTS"; then echo "allowlisted as power bank"; return 0; fi
+    if [ -n "$dev" ]; then
+        if in_list "$dev" "$WALL_DEVICES"; then echo "device $dev listed as wall charger"; return 1; fi
+        if in_list "$dev" "$BANK_DEVICES"; then echo "device $dev listed as power bank"; return 0; fi
+    fi
+    if in_list "$fp" "$WALL_FINGERPRINTS"; then echo "fingerprint listed as wall charger"; return 1; fi
+    if in_list "$fp" "$BANK_FINGERPRINTS"; then echo "fingerprint listed as power bank"; return 0; fi
 
-    if [ "$DETECT_MODE" = "pd" ] && [ -n "$flags" ]; then
+    if [ "$USE_PD_UNCONSTRAINED" = "1" ] && [ -n "$flags" ]; then
         drp="${flags%% *}"; unc="${flags##* }"
         if [ "$unc" = "0" ]; then
             if [ "$REQUIRE_DUAL_ROLE" = "1" ] && [ "$drp" != "1" ]; then
@@ -159,7 +200,7 @@ classify() {
         echo "wattage fallback: ${watts}W <= ${BANK_MAX_WATTS}W"
         return 0
     fi
-    echo "no rule matched"
+    echo "unrecognised source - add ${dev:-$fp} to BANK_DEVICES or WALL_DEVICES"
     return 1
 }
 
@@ -199,7 +240,7 @@ state_clear() { rm -f "$STATE" 2>/dev/null; }
 # --- the decision -------------------------------------------------------------
 
 apply() {
-    local raw pdo flags fp watts reason
+    local raw pdo flags fp dev watts reason
 
     if ! on_ac; then
         case "$ON_BATTERY" in
@@ -215,13 +256,14 @@ apply() {
     flags="$(pd_flags "$pdo")" || flags=""
     watts="$(printf '%s' "$raw" | adapter_field Watts)"
     fp="$(adapter_fingerprint "$raw" "$pdo")" || fp="unknown"
+    dev="$(pd_device_id "$(pd_identity_raw)")" || dev=""
 
-    if reason="$(classify "$fp" "$watts" "$flags")"; then
-        log "power bank: $fp — $reason"
+    if reason="$(classify "$fp" "$dev" "$watts" "$flags")"; then
+        log "power bank: ${dev:-$fp} — $reason"
         state_save
         lpm_set 1
     else
-        log "wall power: $fp — $reason"
+        log "wall power: ${dev:-$fp} — $reason"
         lpm_set "$(state_restore_value)"
         state_clear
     fi
@@ -243,37 +285,43 @@ cmd_watch() {
 }
 
 cmd_identify() {
-    local raw pdo flags fp
+    local raw pdo flags fp meta dev reason rc
     if ! on_ac; then
         echo "Not running on AC — plug the source in and run this again." >&2
-        echo "(PD data persists from the last negotiation and would be stale.)" >&2
+        echo "(PD capability data persists from the last negotiation and would be stale.)" >&2
         return 1
     fi
     raw="$(adapter_raw)"
     pdo="$(pd_pdo_list "$(pd_port_line)")"
     flags="$(pd_flags "$pdo")" || flags=""
     fp="$(adapter_fingerprint "$raw" "$pdo")" || { echo "No adapter details available." >&2; return 1; }
+    meta="$(pd_identity_raw)"
+    dev="$(pd_device_id "$meta")" || dev=""
 
     echo "Attached source:"
+    echo "  device id:   ${dev:-none (no Discover Identity response)}"
     echo "  watts:       $(printf '%s' "$raw" | adapter_field Watts)"
     echo "  description: $(printf '%s' "$raw" | adapter_field Description)"
     echo "  serial:      $(printf '%s' "$raw" | adapter_field SerialString)"
     echo "  fingerprint: $fp"
+    [ -n "$meta" ] && echo "  id header:   $(pd_id_header "$meta" || echo 'undecodable')"
     echo
     if [ -n "$pdo" ]; then
         echo "Advertised USB-PD source capabilities:"
         pd_decode_all "$pdo" | sed 's/^/  /'
         echo
-        echo "  verdict: $(classify "$fp" "$(printf '%s' "$raw" | adapter_field Watts)" "$flags"; \
-            [ $? -eq 0 ] && echo '  => POWER BANK' || echo '  => WALL POWER')"
-    else
-        echo "No live PD contract found — this source may not speak USB-PD."
-        echo "Fall back to an explicit fingerprint entry."
     fi
+    reason="$(classify "$fp" "$dev" "$(printf '%s' "$raw" | adapter_field Watts)" "$flags")"; rc=$?
+    echo "  verdict: $reason"
+    [ $rc -eq 0 ] && echo "  => POWER BANK" || echo "  => WALL POWER"
     echo
-    echo "To force a classification, add the fingerprint to BANK_FINGERPRINTS or"
-    echo "WALL_FINGERPRINTS in $CONFIG:"
-    echo "$fp"
+    if [ -n "$dev" ]; then
+        echo "To classify this source, add to $CONFIG:"
+        echo "  BANK_DEVICES=\"$dev\"     # or WALL_DEVICES"
+    else
+        echo "This source answers no Discover Identity. Use the fingerprint instead:"
+        echo "  BANK_FINGERPRINTS=\"$fp\"     # or WALL_FINGERPRINTS"
+    fi
 }
 
 cmd_status() {
@@ -283,6 +331,7 @@ cmd_status() {
     fp="$(adapter_fingerprint "$raw" "$pdo" 2>/dev/null)" || fp=""
     lpm="$(lpm_current)"
     echo "power source:    $(on_ac && echo 'AC Power' || echo 'Battery Power')"
+    echo "device id:       $(pd_device_id "$(pd_identity_raw)" 2>/dev/null || echo none)"
     echo "source:          ${fp:-none}"
     echo "pd contract:     ${pdo:-none (no live contract)}"
     echo "low power mode:  $lpm"

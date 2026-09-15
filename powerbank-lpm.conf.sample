@@ -1,29 +1,33 @@
 # powerbank-lpm configuration — install to /usr/local/etc/powerbank-lpm.conf
 # Sourced as bash by the root daemon. Keep it root-owned and 0644.
 
-# Detection mechanism:
-#   pd   — use the USB-PD "Unconstrained Power" bit the source advertises.
-#          Spec-defined: a source sets it when backed by mains, clears it when
-#          backed by a limited internal supply (i.e. a battery). This is the
-#          only semantic "am I a power bank" signal macOS exposes.
-#   list — ignore PD bits; trust only the fingerprint lists below.
-DETECT_MODE="pd"
+# --- primary: USB-PD Discover Identity ----------------------------------------
+# The source's own vid:pid, lowercase hex, one per line.
+# Get it by plugging the source in and running: powerbank-lpm identify
+BANK_DEVICES="
+"
+WALL_DEVICES="
+"
 
-# Also require the source to advertise Dual-Role Power (it can sink, i.e. it can
-# recharge itself) before treating it as a power bank. Stricter; set to 1 if a
-# wall charger with sloppy firmware is being misdetected.
-REQUIRE_DUAL_ROLE="0"
-
-# Explicit overrides. Get a fingerprint with: powerbank-lpm identify
-# One per line. WALL_FINGERPRINTS wins over BANK_FINGERPRINTS, and both win over
-# the PD bits — use these when a device's firmware reports the wrong flags.
+# --- fallback: capability fingerprint -----------------------------------------
+# For sources that answer no Discover Identity. Hashes the full advertised rail
+# set plus PPS range, so two same-wattage sources still differ.
 BANK_FINGERPRINTS="
 "
 WALL_FINGERPRINTS="
 "
 
-# Last-resort fallback, only consulted in list mode. Wattage does NOT reliably
-# separate a power bank from a wall charger of the same rating. Leave empty.
+# --- inferred, off by default -------------------------------------------------
+# USB-PD "Unconstrained Power" (bit 27 of the first Fixed PDO) is spec-defined as
+# 0 for a battery-backed source. In practice a real 100 W Anker power bank
+# reports 1, same as a wall charger, so this is OFF. Enable only if your own
+# hardware is honest — check with `powerbank-lpm identify`.
+USE_PD_UNCONSTRAINED="0"
+# Additionally require Dual-Role Power (source can also sink). Stricter.
+REQUIRE_DUAL_ROLE="0"
+
+# Wattage cannot separate a power bank from an equal-rated wall charger.
+# Only consulted if nothing above matched. Leave empty.
 BANK_MAX_WATTS=""
 
 # Behaviour with no adapter attached: on | off | ignore (restore prior setting)

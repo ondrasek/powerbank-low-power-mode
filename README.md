@@ -7,42 +7,41 @@ Event-driven via `pmset -g pslog` — no polling, no menu bar app.
 
 ## How a power bank is detected
 
-**There is no USB vendor/product ID to read.** A PD charger or power bank supplies power
-only; it does not enumerate as a USB data device. `system_profiler SPUSBDataType` is
-empty with one attached, and macOS does not expose the PD Discover Identity VDO
-(vendor ID) anywhere in the IORegistry.
+**Primary: the source's USB-PD Discover Identity (vid:pid).** A PD source does not
+enumerate as a USB data device — `system_profiler SPUSBDataType` is empty with one
+attached — but it does answer a Discover Identity request, and macOS keeps the result in
+the IORegistry:
 
-What macOS *does* expose is the source's advertised **USB-PD Source Capabilities** —
-the raw Power Data Objects, in `ioreg -rn AppleSmartBattery` under
-`PortControllerInfo` → `PortControllerPortPDO`. Those carry a spec-defined bit that
-answers exactly the question we care about:
+```bash
+ioreg -rc IOPortTransportComponentCCUSBPDSOP -w 0 | grep Metadata
+# "Metadata" = {"Product ID"=63077,"Vendor ID"=1204,"VDO Count"=4, ...}
+```
 
-> **Unconstrained Power** (bit 27 of the first Fixed Supply PDO) — set when the source
-> is backed by an effectively unlimited supply (mains), cleared when it is backed by a
-> limited one (a battery).
+`SOP` is the attached source; `SOP'` would be the cable's e-marker, a different device —
+this tool reads only SOP. Unlike the PD capability arrays, this node exists only while a
+source is attached, so it does not go stale.
 
-A spec-compliant power bank clears it; a wall charger sets it. This is the default
-mechanism (`DETECT_MODE="pd"`). A second bit, **Dual-Role Power** (bit 29, "I can also
-sink, i.e. recharge myself"), is available as a stricter `REQUIRE_DUAL_ROLE` check.
+Note the vendor ID identifies the **PD controller chip**, not the brand: a 100 W Anker
+bank reports `04b4:f665`, and `0x04B4` is Cypress/Infineon. So treat vid:pid as a device
+identity to enrol once, not as a brand test. Enrol with `BANK_DEVICES` / `WALL_DEVICES`.
 
-**Confidence: moderate, not high.** The bit is spec-defined and semantic rather than a
-heuristic, but it depends on the device's firmware being honest. Cheap power banks are
-known to misreport PD fields. Verify yours with `powerbank-lpm identify` before trusting
-it, and use the fingerprint lists to override if it lies.
+**Fallback: capability fingerprint.** For sources answering no Discover Identity,
+`identify` prints a hash of the full advertised rail set plus PPS range — far more
+discriminating than wattage, since two 100 W sources with different rails differ.
 
-### If the bits lie: fingerprints
+### What does not work
 
-`powerbank-lpm identify` prints a fingerprint combining wattage, serial (when present),
-and a hash of the **full advertised capability set** — every voltage/current rail plus
-the PPS range. That is far more discriminating than wattage: two 60 W sources with
-different rail sets or PPS ranges produce different hashes.
-
-`BANK_FINGERPRINTS` / `WALL_FINGERPRINTS` in the config override the PD bits entirely.
-
-### Why not wattage
-
-Wattage cannot work, and is off by default. A 60 W power bank and a 60 W wall charger
-are identical on that axis. It remains available as `BANK_MAX_WATTS` in `list` mode only.
+- **Wattage.** A 100 W bank and a 100 W wall charger are identical on that axis.
+- **`system_profiler SPPowerDataType`.** Its `AC Charger Information` reports only
+  `Connected` and `Charging` — no wattage, no ID, no manufacturer.
+- **The USB-PD "Unconstrained Power" bit**, tempting as it looks. The spec defines bit 27
+  of the first Fixed PDO as *cleared* when the source runs off a limited internal supply,
+  i.e. a battery. A real 100 W Anker power bank sets it to **1**, exactly like a wall
+  charger. The bit is available as opt-in `USE_PD_UNCONSTRAINED` but is **off by default**
+  because it is demonstrably unreliable on real hardware.
+- **PD product-type fields.** The ID Header VDO reports `ufp_product_type=3` (PSD) and
+  `dfp_product_type=3` (Power Brick) for the bank. There is no "power bank" product type
+  in the spec.
 
 ## Install
 
@@ -52,14 +51,14 @@ cd powerbank-low-power-mode
 sudo ./install.sh
 ```
 
-Then plug in the power bank and check what it advertises:
+Then plug in the power bank and read its identity:
 
 ```bash
 powerbank-lpm identify
 ```
 
-If the verdict is already `POWER BANK`, you are done. If not, copy the printed
-fingerprint into `BANK_FINGERPRINTS` in `/usr/local/etc/powerbank-lpm.conf` and reload:
+Copy the printed `vid:pid` into `BANK_DEVICES` in `/usr/local/etc/powerbank-lpm.conf`
+(sources without a Discover Identity response use `BANK_FINGERPRINTS` instead), then reload:
 
 ```bash
 sudo launchctl kickstart -k system/com.ondrasek.powerbank-low-power-mode

@@ -11,7 +11,7 @@ and restores the previous setting otherwise. Pure bash; no build step.
 bin/powerbank-lpm   # watch loop, identify, status, doctor — all logic lives here
 launchd/*.plist     # LaunchDaemon definition
 install.sh          # sudo installer; gates on `doctor` (FORCE=1 overrides)
-tests/run.sh        # 32 assertions, no hardware, no root
+tests/run.sh        # 42 assertions, no hardware, no root
 ```
 
 ## Commands
@@ -31,8 +31,9 @@ One decision function, `apply()`, called at startup and on every `pmset -g pslog
 containing `Now drawing from`. Pipeline:
 `adapter_raw`/`pd_port_line` → `pd_pdo_list` → `pd_flags` → `classify` → `lpm_set`.
 
-`classify` precedence: `WALL_FINGERPRINTS` → `BANK_FINGERPRINTS` → PD bits → wattage.
-Explicit lists must always beat inferred bits, because device firmware lies.
+`classify` precedence: `WALL_DEVICES` → `BANK_DEVICES` → `WALL_FINGERPRINTS` →
+`BANK_FINGERPRINTS` → PD bits (opt-in) → wattage. Explicit lists must always beat inferred
+bits — this is not theoretical, the test bank misreports Unconstrained Power.
 
 **State**: `/var/db/powerbank-lpm.state` holds the Low Power Mode value seen *before* the
 tool first overrode it. Disconnect restores that, never a hardcoded `0`.
@@ -44,20 +45,27 @@ hardware access belongs only in `adapter_raw`, `pd_port_line`, `on_ac`, `lpm_cur
 ## Platform facts (verified on macOS 26.5.2, Apple Silicon)
 
 Detection:
-- **No USB vendor/product ID exists for a charger.** It supplies power without enumerating
-  as a data device — `system_profiler SPUSBDataType` is empty with one attached, and the PD
-  Discover Identity VDO is not exposed in the IORegistry. Do not go looking for it again.
+- **The source's vid:pid IS available** — from its USB-PD Discover Identity response, at
+  `ioreg -rc IOPortTransportComponentCCUSBPDSOP` → `Metadata`. Read only the `SOP` node
+  (the attached source); `SOP'` is the cable's e-marker, a different device. This node is
+  absent when nothing is attached, so it does not go stale. The vendor ID is the **PD
+  controller chip vendor**, not the brand (a 100 W Anker bank reports `04b4:f665`, Cypress).
+- A charger does not enumerate as a USB data device — `system_profiler SPUSBDataType` is
+  empty with one attached. Discover Identity is the only identity path.
 - **`system_profiler SPPowerDataType` is useless here**: `AC Charger Information` reports
   only `Connected` and `Charging` — no wattage, no ID, no manufacturer. Guides saying to
   grep wattage from it describe older hardware/macOS.
-- The usable signal is `ioreg -rn AppleSmartBattery` → `PortControllerInfo` →
-  `PortControllerPortPDO`: raw USB-PD Source Capability PDOs. Bit 27 of the first Fixed
-  Supply PDO is **Unconstrained Power** (mains-backed = 1, battery-backed = 0); bit 29 is
-  Dual-Role Power. This is the detection mechanism.
+- `ioreg -rn AppleSmartBattery` → `PortControllerInfo` → `PortControllerPortPDO` holds raw
+  USB-PD Source Capability PDOs. Bit 27 of the first Fixed Supply PDO is **Unconstrained
+  Power**, spec-defined as 0 for a battery-backed source. **Measured: a real 100 W Anker
+  power bank reports 1**, identical to a wall charger. The bit is opt-in
+  (`USE_PD_UNCONSTRAINED`) and off by default — do not re-promote it to primary.
+- ID Header VDO product types are also useless: the bank reports `ufp_product_type=3` (PSD)
+  and `dfp_product_type=3` (Power Brick). The spec has no "power bank" type.
 - **`PortControllerPortPDO` is not cleared on unplug.** It persists from the last
   negotiation. Select the port by live contract (`PortControllerMaxPower > 0`). Selecting
   "the port whose PDO array is non-zero" reports unplugged chargers as attached.
-- Observed wall charger: 5/9/12/15/20 V @ 3 A + PPS 4.5–21 V, `unconstrained_power=1`,
+- Observed 60 W wall charger: 5/9/12/15/20 V @ 3 A + PPS 4.5–21 V, `unconstrained_power=1`,
   `dual_role_power=0`, `Watts=60`, no `Manufacturer`/`SerialString`.
 
 Low Power Mode:
@@ -78,8 +86,9 @@ Shell:
 
 - `pmset` writes require root — a user LaunchAgent cannot do this. If revisiting the sudoers
   alternative, scope it to one exact command, never `/usr/bin/pmset`.
-- Detection confidence is **moderate, not high**: the PD bit is spec-defined but firmware may
-  misreport it. Never document it as guaranteed; keep the fingerprint override path working.
+- Detection is **enrolment-based by design**: the user lists their devices' vid:pid. No
+  inferred signal found so far reliably separates a bank from a charger; treat any new
+  candidate as suspect until measured against both.
 - Wattage cannot distinguish a power bank from an equal-rated wall charger. It stays off by
   default and must not be re-promoted.
 - Use `launchctl bootout` + `bootstrap`, not deprecated `load -w` (silently keeps stale config).

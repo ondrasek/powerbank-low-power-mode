@@ -62,30 +62,54 @@ check "reads live port"  "159486252,184620" "$(pd_pdo_list "$LIVE")"
 check "stale still parses if forced" "159486252,184620" "$(pd_pdo_list "$STALE")"
 check "no match empty"   ""                 "$(pd_pdo_list "")"
 
-echo "classify"
-DETECT_MODE="pd"; REQUIRE_DUAL_ROLE="0"; BANK_FINGERPRINTS=""; WALL_FINGERPRINTS=""; BANK_MAX_WATTS=""
-classify fp 60 "$(pd_flags "$BANK_PDO")" >/dev/null; check "pd: bank detected"  "0" "$?"
-classify fp 60 "$(pd_flags "$WALL_PDO")" >/dev/null; check "pd: wall detected"  "1" "$?"
-classify fp 60 "" >/dev/null;                        check "pd: no flags, no match" "1" "$?"
+echo "pd_device_id / pd_id_header"
+# Real Discover Identity response from a 100 W Anker power bank.
+META='"Metadata" = {"Product ID"=63077,"Vendor ID"=1204,"VDO Count"=4,"bcdDevice"=0,"VDOs"=(<b4048019>,<00000000>,<000065f6>,<00000000>)}'
+check "vid:pid as hex" "04b4:f665" "$(pd_device_id "$META")"
+pd_device_id "" >/dev/null 2>&1; check "no metadata fails" "1" "$?"
+pd_device_id '"Metadata" = {"VDO Count"=0}' >/dev/null 2>&1; check "missing ids fails" "1" "$?"
+# ioreg prints VDO bytes little-endian: <b4048019> is 0x198004b4.
+check "id header decode" "ufp_product_type=3 dfp_product_type=3 modal=0 usb_host=0 usb_device=0" "$(pd_id_header "$META")"
+pd_id_header '"Metadata" = {"VDOs"=(<b404>)}' >/dev/null 2>&1; check "short VDO rejected" "1" "$?"
 
-REQUIRE_DUAL_ROLE="1"
-classify fp 60 "0 0" >/dev/null; check "strict: needs dual-role"   "1" "$?"
-classify fp 60 "1 0" >/dev/null; check "strict: dual-role passes"  "0" "$?"
-REQUIRE_DUAL_ROLE="0"
+echo "classify"
+BANK_DEVICES=""; WALL_DEVICES=""; BANK_FINGERPRINTS=""; WALL_FINGERPRINTS=""
+USE_PD_UNCONSTRAINED="0"; REQUIRE_DUAL_ROLE="0"; BANK_MAX_WATTS=""
+
+classify fp "04b4:f665" 100 "" >/dev/null; check "unknown device rejected" "1" "$?"
+BANK_DEVICES="04b4:f665"
+classify fp "04b4:f665" 100 "" >/dev/null; check "listed device is a bank" "0" "$?"
+classify fp "04b4:0000" 100 "" >/dev/null; check "other device unmatched"  "1" "$?"
+# The real bank reports unconstrained_power=1; an explicit listing must still win.
+classify fp "04b4:f665" 100 "$(pd_flags "$WALL_PDO")" >/dev/null
+check "device list beats pd bits" "0" "$?"
+WALL_DEVICES="04b4:f665"
+classify fp "04b4:f665" 100 "$(pd_flags "$BANK_PDO")" >/dev/null
+check "wall device wins over bank device" "1" "$?"
+BANK_DEVICES=""; WALL_DEVICES=""
 
 BANK_FINGERPRINTS="w=60;pdo=abc;sn="
-classify "w=60;pdo=abc;sn=" 60 "$(pd_flags "$WALL_PDO")" >/dev/null
-check "allowlist overrides pd bits" "0" "$?"
-WALL_FINGERPRINTS="w=60;pdo=abc;sn="
-classify "w=60;pdo=abc;sn=" 60 "$(pd_flags "$BANK_PDO")" >/dev/null
-check "denylist wins over allowlist" "1" "$?"
-BANK_FINGERPRINTS=""; WALL_FINGERPRINTS=""
+classify "w=60;pdo=abc;sn=" "" 60 "" >/dev/null;  check "fingerprint fallback" "0" "$?"
+BANK_DEVICES="04b4:f665"; WALL_FINGERPRINTS="w=60;pdo=abc;sn="
+classify "w=60;pdo=abc;sn=" "04b4:f665" 60 "" >/dev/null
+check "device id outranks fingerprint" "0" "$?"
+BANK_DEVICES=""; BANK_FINGERPRINTS=""; WALL_FINGERPRINTS=""
 
-DETECT_MODE="list"; BANK_MAX_WATTS="65"
-classify fp 60 "$(pd_flags "$BANK_PDO")" >/dev/null; check "list mode ignores pd bits" "0" "$?"
-classify fp 96 "$(pd_flags "$BANK_PDO")" >/dev/null; check "list mode wattage over"    "1" "$?"
-classify fp "" "" >/dev/null;                        check "empty watts no match"      "1" "$?"
-classify fp "abc" "" >/dev/null;                     check "junk watts no match"       "1" "$?"
+USE_PD_UNCONSTRAINED="1"
+classify fp "" 60 "$(pd_flags "$BANK_PDO")" >/dev/null; check "pd bit: bank"  "0" "$?"
+classify fp "" 60 "$(pd_flags "$WALL_PDO")" >/dev/null; check "pd bit: wall"  "1" "$?"
+REQUIRE_DUAL_ROLE="1"
+classify fp "" 60 "0 0" >/dev/null; check "strict: needs dual-role"  "1" "$?"
+classify fp "" 60 "1 0" >/dev/null; check "strict: dual-role passes" "0" "$?"
+REQUIRE_DUAL_ROLE="0"; USE_PD_UNCONSTRAINED="0"
+# Default config must not classify on the bit alone.
+classify fp "" 60 "$(pd_flags "$BANK_PDO")" >/dev/null; check "pd bit ignored by default" "1" "$?"
+
+BANK_MAX_WATTS="65"
+classify fp "" 60 "" >/dev/null;    check "wattage fallback under" "0" "$?"
+classify fp "" 96 "" >/dev/null;    check "wattage fallback over"  "1" "$?"
+classify fp "" "" "" >/dev/null;    check "empty watts no match"   "1" "$?"
+classify fp "" "abc" "" >/dev/null; check "junk watts no match"    "1" "$?"
 
 echo
 echo "passed: $pass  failed: $fail"
