@@ -93,12 +93,43 @@ Before installing, set Low Power Mode to whatever you consider *normal* — the 
 the value in force at first override and restores it on wall power. `doctor` warns if it is
 currently on.
 
-## Why a root LaunchDaemon, not a user LaunchAgent
+## Where it installs: user agent vs root daemon
 
-`pmset` writes require root; a user LaunchAgent cannot set Low Power Mode and fails
-silently in launchd's log. The alternative, a `NOPASSWD` sudoers rule, is wider than it
-looks — `pmset` can schedule wakes and change hibernation, which are persistence
-primitives. If you go that way, scope the rule to one exact command, not the binary.
+Detection needs **no privileges at all** — `ioreg` and `pmset -g` run fine as your user.
+Only the write does, and it cannot be avoided: `pmset -a lowpowermode` requires root.
+
+Worse, it fails *quietly*. Run as a normal user it prints
+`LowPowerMode not supported on AC Power`, changes nothing, and **exits 0**. A user agent
+trusting that exit code looks like it is working while doing nothing. This tool verifies
+every write by reading the value back.
+
+So there are two installs:
+
+**`./install-agent.sh`** — everything under `$HOME`:
+
+```
+~/.local/bin/powerbank-lpm
+~/.config/powerbank-lpm.conf
+~/Library/LaunchAgents/com.ondrasek.powerbank-low-power-mode.plist
+~/Library/Logs/powerbank-lpm.log
+```
+
+plus one privileged file, `/etc/sudoers.d/powerbank-lpm`, containing exactly:
+
+```
+<you> ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 0, /usr/bin/pmset -a lowpowermode 1
+```
+
+sudoers matches the full argument vector, so this grants those two commands and nothing
+else — importantly *not* `pmset` in general, which can also schedule wakes and change
+hibernation, i.e. persistence primitives. The installer validates the file with
+`visudo -c` before installing it. Run it **as yourself**, not with sudo.
+
+**`./install.sh`** — root LaunchDaemon in `/Library/LaunchDaemons`, no sudoers rule.
+
+Neither is fully unprivileged. The agent confines the *running* code to your account and
+needs root once at install; the daemon keeps the running code as root but leaves no
+standing grant to your user account. Pick based on which you would rather audit.
 
 ## Commands
 
@@ -107,11 +138,13 @@ primitives. If you go that way, scope the rule to one exact command, not the bin
 | `powerbank-lpm identify` | Decode the attached source's PD capabilities and verdict |
 | `powerbank-lpm status` | Power source, PD contract, Low Power Mode, daemon state |
 | `powerbank-lpm doctor` | Pre-install checks |
-| `sudo ./install.sh` | Install binary, config and LaunchDaemon |
-| `sudo ./uninstall.sh` | Remove them, restore the saved Low Power Mode value |
+| `./install-agent.sh` | User-level LaunchAgent + scoped sudoers rule (run as yourself) |
+| `./uninstall-agent.sh` | Remove the agent and its sudoers rule |
+| `sudo ./install.sh` | Root LaunchDaemon install |
+| `sudo ./uninstall.sh` | Remove it, restore the saved Low Power Mode value |
 | `./tests/run.sh` | Unit tests — no hardware or root needed |
 
-Logs: `/var/log/powerbank-lpm.log`.
+Logs: `~/Library/Logs/powerbank-lpm.log` (agent) or `/var/log/powerbank-lpm.log` (daemon).
 
 ## Caveat: stale PD data
 

@@ -219,12 +219,32 @@ lpm_current() {
     printf '%s' "${v:-0}"
 }
 
+# Root writes directly; a user-level agent goes through a scoped sudoers rule.
+pmset_write() {
+    if [ "$(id -u)" -eq 0 ]; then
+        pmset -a lowpowermode "$1"
+    else
+        sudo -n /usr/bin/pmset -a lowpowermode "$1"
+    fi
+}
+
+# pmset does NOT report write failures usefully: without privilege it prints
+# "LowPowerMode not supported on <source>" and still exits 0. Trusting the exit
+# code makes a user-level agent look like it is working while changing nothing,
+# so the write is verified by reading the value back.
 lpm_set() {
-    local want="$1" have
+    local want="$1" have out now
     [ -n "$want" ] || return 0
     have="$(lpm_current)"
     [ "$have" = "$want" ] && return 0
-    pmset -a lowpowermode "$want" || { log "pmset -a lowpowermode $want FAILED"; return 1; }
+
+    out="$(pmset_write "$want" 2>&1)"
+    now="$(lpm_current)"
+    if [ "$now" != "$want" ]; then
+        log "FAILED to set low power mode to $want (still $now)${out:+ — $out}"
+        [ "$(id -u)" -ne 0 ] && log "  not running as root and 'sudo -n pmset' did not succeed"
+        return 1
+    fi
     log "low power mode ${have:-?} -> $want"
 }
 
@@ -337,8 +357,18 @@ cmd_status() {
     echo "low power mode:  $lpm"
     echo "saved state:     $([ -f "$STATE" ] && head -1 "$STATE" || echo 'none')"
     echo "config:          $CONFIG $([ -f "$CONFIG" ] || echo '(missing)')"
-    launchctl print "system/$LABEL" >/dev/null 2>&1 &&
-        echo "daemon:          loaded" || echo "daemon:          not loaded"
+    if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+        echo "launchd:         loaded (system daemon)"
+    elif launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        echo "launchd:         loaded (user agent)"
+    else
+        echo "launchd:         not loaded"
+    fi
+    if [ "$(id -u)" -ne 0 ]; then
+        sudo -n /usr/bin/pmset -a lowpowermode "$(lpm_current)" >/dev/null 2>&1 &&
+            echo "privilege:       sudoers rule present" ||
+            echo "privilege:       NONE — writes will fail (run as root, or install-agent.sh)"
+    fi
 }
 
 cmd_doctor() {
@@ -368,8 +398,18 @@ cmd_doctor() {
         rc=2
     else echo ok; fi
 
-    printf 'running as root:          '
-    [ "$(id -u)" -eq 0 ] && echo yes || echo "no (writes will fail; the daemon runs as root)"
+    printf 'privilege to write:       '
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "yes (root)"
+    elif sudo -n /usr/bin/pmset -a lowpowermode "$(lpm_current)" >/dev/null 2>&1; then
+        echo "yes (scoped sudoers rule)"
+    else
+        echo "NO — not root and no sudoers rule."
+        echo "                          pmset exits 0 even when the write is refused, so this"
+        echo "                          would fail silently. Use ./install.sh (root daemon) or"
+        echo "                          ./install-agent.sh (user agent + scoped sudoers rule)."
+        rc=1
+    fi
     return $rc
 }
 

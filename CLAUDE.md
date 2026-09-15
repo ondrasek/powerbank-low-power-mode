@@ -10,7 +10,8 @@ and restores the previous setting otherwise. Pure bash; no build step.
 ```
 bin/powerbank-lpm   # watch loop, identify, status, doctor — all logic lives here
 launchd/*.plist     # LaunchDaemon definition
-install.sh          # sudo installer; gates on `doctor` (FORCE=1 overrides)
+install.sh          # root LaunchDaemon install; gates on `doctor` (FORCE=1 overrides)
+install-agent.sh    # user LaunchAgent under $HOME + scoped sudoers rule; run as the user
 tests/run.sh        # 42 assertions, no hardware, no root
 ```
 
@@ -89,8 +90,11 @@ Shell:
 
 ## Constraints
 
-- `pmset` writes require root — a user LaunchAgent cannot do this. If revisiting the sudoers
-  alternative, scope it to one exact command, never `/usr/bin/pmset`.
+- `pmset` writes require root. **`pmset` exits 0 even when the write is refused** — as a
+  non-root user it prints "LowPowerMode not supported on <source>" and changes nothing.
+  Never trust its exit code; `lpm_set` verifies by reading the value back.
+- Two install paths: root daemon (`install.sh`) and user agent + sudoers (`install-agent.sh`).
+  The sudoers rule lists two exact argument vectors; never widen it to `/usr/bin/pmset`.
 - Detection is **enrolment-based by design**: the user lists their devices' vid:pid. No
   inferred signal found so far reliably separates a bank from a charger; treat any new
   candidate as suspect until measured against both.
